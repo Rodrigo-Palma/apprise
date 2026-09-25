@@ -51,23 +51,20 @@ from .common import (
 from .config.base import ConfigBase
 from .conversion import convert_between
 from .dispatch import (
+    CallState,
     RetryRunner,
-    TagChain,
-    aggregate_status,
+    ServiceCall,
     call_with_retry,
     compute_deadline,
     configured_max_attempts,
-    dispatch_crashed,
     service_crashed,
     service_metadata,
-    template_status,
     timeout_result,
-    validate_timeout,
 )
 from .emojis import apply_emojis
 from .exception import AppriseImproperlyConfigured, AppriseTemplateError
 from .locale import AppriseLocale
-from .logger import NotifyLogEntry, _ServiceLogCapture, logger
+from .logger import NotifyLogEntry, logger
 from .manager_plugins import NotificationManager
 from .plugins.base import (
     _PAYLOAD_PRECAPPED,
@@ -92,10 +89,6 @@ from .utils.template import (
 
 # Grant access to our Notification Manager Singleton
 N_MGR = NotificationManager()
-
-# One (service, notify()-kwargs) pair as produced by _create_notify_gen()
-# and threaded through every dispatch primitive below.
-ServiceCall = tuple[NotifyBase, dict[str, Any]]
 
 # Extra seconds of patience for notify() calls.
 _ABANDON_GRACE_SECONDS = 0.1
@@ -827,25 +820,6 @@ class Apprise:
         return result
 
     @staticmethod
-    def _inject_log_callback(all_calls, log_callback):
-        """Inject _log_callback into every call's kwargs. No-op if
-        log_callback is None."""
-        if log_callback is None:
-            return all_calls
-        return [
-            (service, dict(kwargs, _log_callback=log_callback))
-            for service, kwargs in all_calls
-        ]
-
-    @staticmethod
-    def _inject_log_level(all_calls, log_level):
-        """Add the chosen capture level to every service call."""
-        return [
-            (service, dict(kwargs, _log_level=log_level))
-            for service, kwargs in all_calls
-        ]
-
-    @staticmethod
     def _resolve_call_level(
         effective_log_level: Optional[int],
         effective_log_callback: Optional[
@@ -1125,38 +1099,7 @@ class Apprise:
         WARNING, or INFO when a log_callback is active. Use DEBUG or TRACE for
         more detail.
         """
-        timeout = validate_timeout(timeout)
-        effective_log_callback = (
-            log_callback if log_callback is not None else self._log_callback
-        )
-        effective_log_level = (
-            log_level if log_level is not None else self._log_level
-        )
-        call_level = Apprise._resolve_call_level(
-            effective_log_level, effective_log_callback
-        )
-
-        # Entries held back because a template value was never supplied
-        skipped = []
-
-        # Wall-clock start for AppriseResult.elapsed -- covers the entire
-        # call, including argument validation, not just service dispatch.
-        start = time.monotonic()
-
-        # Apply the call timeout without replacing each service's own limit.
-        call_deadline: Optional[float] = (
-            time.monotonic() + timeout if timeout else None
-        )
-
-        # Capture orchestration logs not owned by a service attempt.
-        # The capture reads its limits from the asset already held by Apprise.
-        with _ServiceLogCapture(
-            service=None,
-            log_callback=effective_log_callback,
-            level=call_level,
-            memory_size=self.asset.result_log_memory_size,
-            disk_size=self.asset.result_log_disk_size,
-        ) as call_capture:
+        with CallState(self, tag, timeout, log_callback, log_level) as call:
             try:
                 all_calls = list(
                     self._create_notify_gen(
@@ -1169,114 +1112,58 @@ class Apprise:
                         attach=attach,
                         interpret_escapes=interpret_escapes,
                         template=template,
-                        report=skipped,
+                        report=call.skipped,
                     )
                 )
 
-            except TypeError:
-                # Invalid notify() arguments -- no service was ever attempted.
-                return AppriseResult(
-                    status=AppriseResultStatus.FAILURE,
-                    results=[],
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+            except TypeError as e:
+                # This signature rejects an unknown argument before the
+                # block above runs, so anything landing here came from
+                # preparing the content -- usually a plugin that raised.
+                return call.unprepared(e)
 
             if not all_calls:
                 # Tag filter matched nothing, or no services are loaded at all.
-                return AppriseResult(
-                    status=template_status(
-                        AppriseResultStatus.NOMATCH, skipped
-                    ),
-                    results=[],
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+                return call.result(AppriseResultStatus.NOMATCH)
 
             # Apply the first matching retry suffix to each service.
-            all_calls = Apprise._inject_per_service_retries(all_calls, tag)
-            all_calls = Apprise._inject_log_callback(
-                all_calls, effective_log_callback
-            )
-            all_calls = Apprise._inject_log_level(all_calls, call_level)
+            all_calls = call.prepare(all_calls)
 
             if Apprise._filter_has_explicit_priority(tag):
                 # An explicit priority sends one flat batch without escalation.
                 try:
-                    ok, results = Apprise._split_and_dispatch(
-                        all_calls, call_deadline=call_deadline
+                    outcome = Apprise._split_and_dispatch(
+                        all_calls, call_deadline=call.deadline
                     )
 
                 except Exception as e:
-                    # Safety net; report the crash instead of raising it.
-                    dispatch_crashed(e)
-                    ok, results = False, []
-                return AppriseResult(
-                    status=template_status(
-                        aggregate_status(ok, results), skipped
-                    ),
-                    results=results,
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+                    # Hand the crash over as the batch outcome.
+                    outcome = e
+
+                return call.flat(outcome)
 
             # Without an explicit priority:
             # - Each OR tag becomes an independent chain.
             # - Each chain starts at its highest priority.
             # - A failed group advances only its own chain.
             # - Active chains run concurrently.
-            chains = Apprise._build_tag_chains(all_calls, tag)
+            call.escalate(all_calls)
 
-            chain_states = [
-                TagChain(key, groups) for key, groups in chains.items()
-            ]
-
-            # Every NotifyResult actually dispatched across every chain and
-            # every priority-group attempt, in the order each batch was run.
-            all_results = []
-
-            while True:
-                # When abort_on_chain_failure is enabled, stop as soon as any
-                # chain has exhausted all its priority groups without
-                # success. With the default (False) all chains run to
-                # completion even if one has already failed, so every
-                # defined URL gets an attempt.
-                if self.asset.abort_on_chain_failure and any(
-                    not chain.succeeded and chain.exhausted
-                    for chain in chain_states
-                ):
-                    return AppriseResult(
-                        status=template_status(
-                            aggregate_status(False, all_results),
-                            skipped,
-                        ),
-                        results=all_results,
-                        elapsed=time.monotonic() - start,
-                        call_logs=call_capture.entries,
-                    )
-
-                # Collect chains that still need to try their next
-                # priority group.
-                active = [chain for chain in chain_states if chain.pending]
-                if not active:
-                    break  # every chain has either succeeded or been exhausted
-
+            for active in call.rounds():
                 if len(active) == 1:
                     # Single active chain: dispatch directly, no thread
                     # overhead.
                     chain = active[0]
                     try:
-                        ok, batch_results = Apprise._split_and_dispatch(
-                            chain.batch, call_deadline=call_deadline
+                        outcome = Apprise._split_and_dispatch(
+                            chain.batch, call_deadline=call.deadline
                         )
 
                     except Exception as e:
-                        # Safety net; a crash escalates like a failure.
-                        chain.crashed(e)
-                        continue
+                        # Hand the crash over as the batch outcome.
+                        outcome = e
 
-                    all_results.extend(batch_results)
-                    chain.settle(ok)
+                    call.settle(chain, outcome)
                     continue
 
                 # Run active chains in the coordinator pool so their
@@ -1287,7 +1174,7 @@ class Apprise:
                         executor,
                         Apprise._split_and_dispatch,
                         chain.batch,
-                        call_deadline,
+                        call.deadline,
                     ): chain
                     for chain in active
                 }
@@ -1295,25 +1182,15 @@ class Apprise:
                 # even when chains finish in a different order.
                 for future, chain in future_map.items():
                     try:
-                        ok, batch_results = future.result()
+                        outcome = future.result()
 
                     except Exception as e:
-                        # Safety net; a crash escalates like a failure.
-                        chain.crashed(e)
-                        continue
+                        # Hand the crash over as the batch outcome.
+                        outcome = e
 
-                    all_results.extend(batch_results)
-                    chain.settle(ok)
+                    call.settle(chain, outcome)
 
-            success = all(chain.succeeded for chain in chain_states)
-            return AppriseResult(
-                status=template_status(
-                    aggregate_status(success, all_results), skipped
-                ),
-                results=all_results,
-                elapsed=time.monotonic() - start,
-                call_logs=call_capture.entries,
-            )
+            return call.finish()
 
     async def async_notify(self, *args: Any, **kwargs: Any) -> AppriseResult:
         """Asynchronously notify all loaded plugins.
@@ -1324,158 +1201,68 @@ class Apprise:
         tag = kwargs.get("tag", common.MATCH_ALL_TAG)
 
         # Pop these -- none is a _create_notify_gen() parameter.
-        timeout: Union[int, float] = validate_timeout(kwargs.pop("timeout", 0))
-        log_callback: Optional[
-            Callable[[NotifyLogEntry, Optional[NotifyBase]], None]
-        ] = kwargs.pop("log_callback", None)
-        effective_log_callback = (
-            log_callback if log_callback is not None else self._log_callback
-        )
-        log_level: Optional[int] = kwargs.pop("log_level", None)
-        effective_log_level = (
-            log_level if log_level is not None else self._log_level
-        )
-        call_level = Apprise._resolve_call_level(
-            effective_log_level, effective_log_callback
-        )
+        with CallState(
+            self,
+            tag,
+            kwargs.pop("timeout", 0),
+            kwargs.pop("log_callback", None),
+            kwargs.pop("log_level", None),
+        ) as call:
+            # Entries held back because a template value was never supplied.
+            kwargs["report"] = call.skipped
 
-        # Entries held back because a template value was never supplied
-        skipped = []
-        kwargs["report"] = skipped
-
-        # Wall-clock start for AppriseResult.elapsed -- see notify().
-        start = time.monotonic()
-
-        # See notify() for what this is.
-        call_deadline: Optional[float] = (
-            time.monotonic() + timeout if timeout else None
-        )
-
-        # Capture orchestration logs not owned by a service attempt.
-        # The capture reads its limits from the asset already held by Apprise.
-        with _ServiceLogCapture(
-            service=None,
-            log_callback=effective_log_callback,
-            level=call_level,
-            memory_size=self.asset.result_log_memory_size,
-            disk_size=self.asset.result_log_disk_size,
-        ) as call_capture:
             try:
                 all_calls = list(self._create_notify_gen(*args, **kwargs))
 
-            except TypeError:
-                # Invalid notify() arguments -- no service was ever attempted.
-                return AppriseResult(
-                    status=AppriseResultStatus.FAILURE,
-                    results=[],
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+            except TypeError as e:
+                # This signature takes *args/**kwargs, so an unknown
+                # argument reaches here as well as anything raised while
+                # preparing the content.
+                return call.unprepared(e)
 
             if not all_calls:
                 # Tag filter matched nothing, or no services are loaded at all.
-                return AppriseResult(
-                    status=template_status(
-                        AppriseResultStatus.NOMATCH, skipped
-                    ),
-                    results=[],
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+                return call.result(AppriseResultStatus.NOMATCH)
 
             # Inject per-service call-time retry overrides (same logic as
             # notify).
-            all_calls = Apprise._inject_per_service_retries(all_calls, tag)
-            all_calls = Apprise._inject_log_callback(
-                all_calls, effective_log_callback
-            )
-            all_calls = Apprise._inject_log_level(all_calls, call_level)
+            all_calls = call.prepare(all_calls)
 
             if Apprise._filter_has_explicit_priority(tag):
                 # Explicit priority prefix: flat dispatch, no escalation.
                 try:
-                    ok, results = await Apprise._split_and_dispatch_async(
-                        all_calls, call_deadline=call_deadline
+                    outcome = await Apprise._split_and_dispatch_async(
+                        all_calls, call_deadline=call.deadline
                     )
 
                 except Exception as e:
-                    # Safety net; report the crash instead of raising it.
-                    dispatch_crashed(e)
-                    ok, results = False, []
-                return AppriseResult(
-                    status=template_status(
-                        aggregate_status(ok, results), skipped
-                    ),
-                    results=results,
-                    elapsed=time.monotonic() - start,
-                    call_logs=call_capture.entries,
-                )
+                    # Hand the crash over as the batch outcome.
+                    outcome = e
+
+                return call.flat(outcome)
 
             # Use the same independent escalation chains as notify(). Active
             # groups run together; only a failed chain advances.
-            chains = Apprise._build_tag_chains(all_calls, tag)
+            call.escalate(all_calls)
 
-            chain_states = [
-                TagChain(key, groups) for key, groups in chains.items()
-            ]
-
-            # Every NotifyResult actually dispatched across every chain and
-            # every priority-group attempt, in the order each batch was run.
-            all_results = []
-
-            while True:
-                # Same abort_on_chain_failure guard as notify().
-                if self.asset.abort_on_chain_failure and any(
-                    not chain.succeeded and chain.exhausted
-                    for chain in chain_states
-                ):
-                    return AppriseResult(
-                        status=template_status(
-                            aggregate_status(False, all_results),
-                            skipped,
-                        ),
-                        results=all_results,
-                        elapsed=time.monotonic() - start,
-                        call_logs=call_capture.entries,
-                    )
-
-                active = [chain for chain in chain_states if chain.pending]
-                if not active:
-                    break  # every chain has either succeeded or been exhausted
-
+            for active in call.rounds():
                 # Run active chains together. Keep one failure from cancelling
-                # the others, then handle each result below.
+                # the others; gather() hands a cancellation back as a value,
+                # so settle() receives it like any other outcome.
                 gathered = await asyncio.gather(
                     *(
                         Apprise._split_and_dispatch_async(
-                            chain.batch, call_deadline=call_deadline
+                            chain.batch, call_deadline=call.deadline
                         )
                         for chain in active
                     ),
                     return_exceptions=True,
                 )
 
-                for chain, item in zip(active, gathered):
-                    # gather() hands back BaseException, so a cancellation
-                    # lands here too instead of being unpacked as a result.
-                    if isinstance(item, BaseException):
-                        # Safety net; a crash escalates like a failure.
-                        chain.crashed(item)
-                        continue
+                for chain, outcome in zip(active, gathered):
+                    call.settle(chain, outcome)
 
-                    ok, batch_results = item
-                    all_results.extend(batch_results)
-                    chain.settle(ok)
-
-            success = all(chain.succeeded for chain in chain_states)
-            return AppriseResult(
-                status=template_status(
-                    aggregate_status(success, all_results), skipped
-                ),
-                results=all_results,
-                elapsed=time.monotonic() - start,
-                call_logs=call_capture.entries,
-            )
+            return call.finish()
 
     def _create_notify_calls(self, *args, **kwargs):
         """Creates notifications for all the plugins loaded.
